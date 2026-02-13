@@ -4,11 +4,22 @@ Small J-Wave Acoustic Wave Propagation Test with 3 cylinders, more to come....
 
 
 
+
 # Acoustic Continuous Waves
+
+
+## Interactive Demo for acoustic continuous wave propagation with cylinders:
+
+https://github.com/user-attachments/assets/db5162c6-249c-44d7-9078-3ba325fe93f6
+
+#### Interactive GUI 2nd Step
+![Interactive GUI](GUIFRONT.png)
+
 
 https://github.com/user-attachments/assets/f696cf68-d3f9-47a9-9684-da3b96fcb36d
 
 Time for simulation: 72.61s
+
 
 
 ### Configuration 1
