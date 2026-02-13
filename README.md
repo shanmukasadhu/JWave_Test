@@ -4,7 +4,20 @@ Small J-Wave Acoustic Wave Propagation Test with 3 cylinders, more to come....
 
 ---
 
-## Cylinder Configurations with single acoustic pulse
+## Interactive Demo for acoustic wave propagation with cylinders:
+
+https://github.com/user-attachments/assets/1ad4e7c7-2722-40ae-83f9-c5bdef66e5e8
+
+#### Interactive GUI 1st Step
+![Interactive GUI](InteractiveGUIFront.png)
+
+#### Interactive GUI 2nd Step
+![Interactive GUI](InteractiveGUI.png)
+
+
+---
+
+## Cylinder Configurations with a single acoustic pulse
 
 ### Configuration 1
 
@@ -49,7 +62,7 @@ https://github.com/user-attachments/assets/3b7e7a61-58a9-4f23-a510-094482ff12ef
 
 https://github.com/user-attachments/assets/ddada8ce-41b6-4a02-b351-a37668de792a
 
-## Cylinder Configurations of varying radii with a single acoustic pulse of 
+## Cylinder Configurations of varying radii with a single acoustic pulse 
 
 ### Configuration 1
 
@@ -70,6 +83,5 @@ https://github.com/user-attachments/assets/aed9c9f1-1715-43ed-be05-76adda12d6e0
 ### Configuration 5
 
 https://github.com/user-attachments/assets/2be62b58-726f-47e9-bbf0-18a8da8facd5
-
 
 
