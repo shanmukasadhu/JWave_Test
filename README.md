@@ -13,23 +13,23 @@ Time for simulation: 72.61s
 
 ### Configuration 1
 
-https://github.com/user-attachments/assets/42f3bb48-f485-4a63-9e20-ab85e5c798f8
+https://github.com/user-attachments/assets/cb2b8fc8-1f68-4a2f-9e14-ea0e4c764205
 
 ### Configuration 2
 
-https://github.com/user-attachments/assets/460521de-a9aa-4344-968e-ada34181e2ea
+https://github.com/user-attachments/assets/260cb564-3a04-4d4a-9cda-11ebee41d30b
 
 ### Configuration 3
 
-https://github.com/user-attachments/assets/5e294553-1e19-418e-bb8e-d0956ae678b9
+https://github.com/user-attachments/assets/973237ad-80ae-43ae-9e2e-0362501b09a4
 
 ### Configuration 4
 
-https://github.com/user-attachments/assets/90c11580-e0cb-4443-b4e0-7a17e8d95565
+https://github.com/user-attachments/assets/522ecbea-9a7f-40b1-93dd-916099c65aed
 
 ### Configuration 5
 
-https://github.com/user-attachments/assets/8f89d5d4-ab90-481d-9bdb-f36374c39f29
+https://github.com/user-attachments/assets/c3edac4d-a04b-4e87-9f66-5892b1d6b64b
 
 
 
