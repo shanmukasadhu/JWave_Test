@@ -11,6 +11,28 @@ https://github.com/user-attachments/assets/f696cf68-d3f9-47a9-9684-da3b96fcb36d
 Time for simulation: 72.61s
 
 
+### Configuration 1
+
+https://github.com/user-attachments/assets/42f3bb48-f485-4a63-9e20-ab85e5c798f8
+
+### Configuration 2
+
+https://github.com/user-attachments/assets/460521de-a9aa-4344-968e-ada34181e2ea
+
+### Configuration 3
+
+https://github.com/user-attachments/assets/5e294553-1e19-418e-bb8e-d0956ae678b9
+
+### Configuration 4
+
+https://github.com/user-attachments/assets/90c11580-e0cb-4443-b4e0-7a17e8d95565
+
+### Configuration 5
+
+https://github.com/user-attachments/assets/8f89d5d4-ab90-481d-9bdb-f36374c39f29
+
+
+
 ---
 # Acoustic Single Pulse Wave
 ---
