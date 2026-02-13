@@ -2,6 +2,14 @@
 
 Small J-Wave Acoustic Wave Propagation Test with 3 cylinders, more to come....
 
+
+
+# Acoustic Continuous Waves
+
+https://github.com/user-attachments/assets/f696cf68-d3f9-47a9-9684-da3b96fcb36d
+
+---
+# Acoustic Single Pulse Wave
 ---
 
 ## Interactive Demo for acoustic wave propagation with cylinders:
