@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/4fc57d99-b679-4cac-92f1-8ad60d2c6a3a
 
 https://github.com/user-attachments/assets/d1cf4399-b0fc-494b-b9d5-043a74a6a75b
 
-## Cylinder Configurations with single acoustic pulse showing max pressure point
+## Cylinder Configurations with a single acoustic pulse showing the max pressure point
 
 ### Configuration 1
 
@@ -40,6 +40,7 @@ https://github.com/user-attachments/assets/e393404c-8468-4049-8c84-b6673cc5d05a
 
 https://github.com/user-attachments/assets/99be7b8f-91e4-4508-ae8c-b1be66c30a2e
 
+
 ### Configuration 4
 
 https://github.com/user-attachments/assets/3b7e7a61-58a9-4f23-a510-094482ff12ef
@@ -47,5 +48,28 @@ https://github.com/user-attachments/assets/3b7e7a61-58a9-4f23-a510-094482ff12ef
 ### Configuration 5
 
 https://github.com/user-attachments/assets/ddada8ce-41b6-4a02-b351-a37668de792a
+
+## Cylinder Configurations of varying radii with a single acoustic pulse of 
+
+### Configuration 1
+
+https://github.com/user-attachments/assets/64809fcb-eb7b-4063-9d31-d5403f2e4ba0
+
+### Configuration 2
+
+https://github.com/user-attachments/assets/f688ac15-e7fe-4e2d-b822-ce4a0b596391
+
+### Configuration 3
+
+https://github.com/user-attachments/assets/abff3ccf-998e-4283-ac32-05ce4df10f58
+
+### Configuration 4
+
+https://github.com/user-attachments/assets/aed9c9f1-1715-43ed-be05-76adda12d6e0
+
+### Configuration 5
+
+https://github.com/user-attachments/assets/2be62b58-726f-47e9-bbf0-18a8da8facd5
+
 
 
