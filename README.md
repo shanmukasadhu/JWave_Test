@@ -8,6 +8,9 @@ Small J-Wave Acoustic Wave Propagation Test with 3 cylinders, more to come....
 
 https://github.com/user-attachments/assets/f696cf68-d3f9-47a9-9684-da3b96fcb36d
 
+Time for simulation: 72.61s
+
+
 ---
 # Acoustic Single Pulse Wave
 ---
