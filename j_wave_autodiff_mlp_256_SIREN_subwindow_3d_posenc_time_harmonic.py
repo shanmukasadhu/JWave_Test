@@ -41,7 +41,7 @@ print("=" * 70)
 
 # 3D grid with optional scale factor: same physical domain, more grid points when scale > 1.
 # Physical size and sphere/design box stay the same; only resolution increases.
-_grid_scale = int(os.environ.get("GRID_SCALE", "2"))
+_grid_scale = int(os.environ.get("GRID_SCALE", "1"))
 _base_n = 64
 
 N = (_base_n * _grid_scale, _base_n * _grid_scale, _base_n * _grid_scale)
@@ -60,21 +60,28 @@ print(f"Physical domain: {N[0]*dx[0]:.4f} m")
 domain = Domain(N, dx)
 
 # Geometry (scale grid indices so physical positions and sizes are unchanged)
+# PML is 20 voxels thick on each face. On a 64-voxel grid the active (non-PML)
+# region is x=20..44, y=20..44, z=20..44. Everything outside is absorbed.
+# Source is injected at x=0..12 (inside left PML) to produce an incoming plane wave.
+# Lens: x=20..35 (active region, just past left PML boundary)
+# Focal sphere: x=40, y=32, z=32 (center of domain laterally, 4 vox before right PML)
 design_boundary_x = 35 * _grid_scale
-focus_boundary_x = 45 * _grid_scale
+focus_boundary_x = 38 * _grid_scale
 
-# Subwindow in 3D
-subwindow_fraction = 0.50
-subwindow_x_start = int(0.5 * (1.0 - subwindow_fraction) * design_boundary_x)
-subwindow_x_end = int(0.5 * (1.0 + subwindow_fraction) * design_boundary_x)
-subwindow_y_start = int(0.5 * (1.0 - subwindow_fraction) * N[1])
-subwindow_y_end = int(0.5 * (1.0 + subwindow_fraction) * N[1])
-subwindow_z_start = int(0.5 * (1.0 - subwindow_fraction) * N[2])
-subwindow_z_end = int(0.5 * (1.0 + subwindow_fraction) * N[2])
+# Subwindow: spans the lens region fully in x, full lateral extent in y/z
+subwindow_x_start = 20 * _grid_scale
+subwindow_x_end = 35 * _grid_scale
+subwindow_y_start = 16 * _grid_scale
+subwindow_y_end = 48 * _grid_scale
+subwindow_z_start = 16 * _grid_scale
+subwindow_z_end = 48 * _grid_scale
 
 # Focal sphere (radius in grid points scales so physical radius is unchanged)
-target_focal_center = (50 * _grid_scale, 32 * _grid_scale, 32 * _grid_scale)
+target_focal_center = (40 * _grid_scale, 32 * _grid_scale, 32 * _grid_scale)
 focal_sphere_radius = 4 * _grid_scale
+# Combined loss weights: shell penalty, binary material entropy
+lambda_shell = float(os.environ.get("LAMBDA_SHELL", "0.2"))
+lambda_entropy = float(os.environ.get("LAMBDA_ENTROPY", "0.02"))
 
 # Angular frequency for Helmholtz
 omega = 2.0 * jnp.pi * frequency
@@ -82,11 +89,12 @@ omega = 2.0 * jnp.pi * frequency
 # MLP
 model_type = os.environ.get("AUTODIFF_MLP_TYPE", "siren").strip().lower()
 siren_layer_sizes = [3, 64, 64, 32, 1]  # input (x,y,z) only, no positional encoding
-siren_omega0 = 30.0
+siren_omega0 = 60.0
 siren_seed = 42
 
 print(f"\nConfiguration: MLP type={model_type}")
 print(f"  Layers: {siren_layer_sizes}, ω₀={siren_omega0}")
+print(f"  Combined loss: λ_shell={lambda_shell}, λ_entropy={lambda_entropy}")
 print(f"  Subwindow: x=[{subwindow_x_start},{subwindow_x_end}], y=[{subwindow_y_start},{subwindow_y_end}], z=[{subwindow_z_start},{subwindow_z_end}]")
 print("=" * 70)
 
@@ -153,7 +161,7 @@ def material_field_from_mlp(params):
         subwindow_y_start : subwindow_y_end + 1,
         subwindow_z_start : subwindow_z_end + 1,
     ].set(rho_water + (rho_cylinder - rho_water) * alpha_sw)
-    return sound_speed, density
+    return sound_speed, density, alpha_sw
 
 
 def create_sphere_mask_3d_smooth(N, center, radius, steepness=2.0):
@@ -204,23 +212,59 @@ def run_helmholtz(medium):
 
 
 def compute_objective_mlp(params):
-    sound_speed, density = material_field_from_mlp(params)
+    sound_speed, density, _ = material_field_from_mlp(params)
     medium = create_medium_from_material_field(domain, sound_speed, density)
     pressure_complex = run_helmholtz(medium)
     p_mag = jnp.abs(pressure_complex.on_grid[..., 0])
+
+    # Diagnostics: if these print the same every iteration, solve is cached/broken
+    jax.debug.print("p_mag max={x}", x=jnp.max(p_mag))
+    jax.debug.print("p_mag mean={x}", x=jnp.mean(p_mag))
+    # Hotspot x-location: if migrating toward focal (x=55), focusing is happening
+    jax.debug.print("p_max_loc x={x}", x=jnp.argmax(jnp.max(p_mag, axis=(1, 2))))
+
+    p_sq = p_mag**2
     sphere_mask = create_sphere_mask_3d_smooth(N, target_focal_center, focal_sphere_radius)
-    pressure_in_sphere = p_mag * sphere_mask
-    n_points = jnp.sum(sphere_mask)
-    total_sq = jnp.sum(pressure_in_sphere**2)
-    mean_sq = total_sq / jnp.maximum(n_points, 1.0)
-    return -jnp.sqrt(mean_sq)
+
+    focal_rms = jnp.sqrt(
+        jnp.sum(p_sq * sphere_mask) / jnp.maximum(jnp.sum(sphere_mask), 1.0)
+    )
+
+    # Annular shell R–2R: near-field spillover right around the sphere
+    shell_mask = jnp.clip(
+        create_sphere_mask_3d_smooth(N, target_focal_center, focal_sphere_radius * 2.0)
+        - sphere_mask,
+        0.0, 1.0,
+    )
+    shell_sum = jnp.maximum(jnp.sum(shell_mask), 1.0)
+    rms_shell = jnp.sqrt(jnp.sum(p_sq * shell_mask) / shell_sum + 1e-20)
+
+    # Far-field region: everything beyond 2R (excludes both sphere and shell).
+    # Needed for gradient flow — shell alone is too sparse for the adjoint GMRES.
+    # Excluded from the primary objective so it doesn't pull pressure in the sphere down.
+    far_mask = jnp.clip(
+        1.0 - create_sphere_mask_3d_smooth(N, target_focal_center, focal_sphere_radius * 2.0),
+        0.0, 1.0,
+    )
+    far_sum = jnp.maximum(jnp.sum(far_mask), 1.0)
+    rms_far = jnp.sqrt(jnp.sum(p_sq * far_mask) / far_sum + 1e-20)
+
+    # Monitoring only
+    mean_rms = jnp.sqrt(jnp.mean(p_sq) + 1e-20)
+    contrast = focal_rms / (mean_rms + 1e-6)
+    focal_energy_frac = jnp.sum(p_sq * sphere_mask) / (jnp.sum(p_sq) + 1e-20)
+
+    # Maximize RMS inside focus sphere, minimize RMS in the shell (R–2R).
+    # rms_far (weight 0.4) provides gradient flow for the adjoint GMRES solve.
+    loss = -focal_rms + 0.3 * rms_shell + 0.4 * rms_far
+    return loss, (focal_rms, contrast, focal_energy_frac, rms_shell)
 
 
 key = jax.random.PRNGKey(siren_seed)
 initial_params = siren_init(key, siren_layer_sizes, siren_omega0)
 
-learning_rate = float(os.environ.get("AUTODIFF_LR", "0.0005"))
-n_iterations = int(os.environ.get("AUTODIFF_N_ITER", "30"))
+learning_rate = float(os.environ.get("AUTODIFF_LR", "0.0001"))
+n_iterations = int(os.environ.get("AUTODIFF_N_ITER", "100"))
 # Helmholtz linear-solver knobs (from jwave/acoustics/time_harmonic.py):
 # tol, restart, maxiter, solve_method, method, checkpoint.
 _linear_solver_method = os.environ.get("HELMHOLTZ_METHOD", "gmres").strip().lower()
@@ -233,6 +277,8 @@ _solver_maxiter = int(os.environ.get("HELMHOLTZ_MAXITER", "300"))
 _gmres_solve_method = os.environ.get("HELMHOLTZ_GMRES_SOLVE_METHOD", "batched").strip().lower()
 if _gmres_solve_method not in ("batched", "incremental"):
     _gmres_solve_method = "batched"
+# Must be True: checkpoint=False causes UnexpectedTracerError in jaxdf FourierSeries.
+# Use safe path (checkpoint=True) which avoids the tracer leak.
 _safe_helmholtz_call = os.environ.get("HELMHOLTZ_SAFE_MODE", "1").strip().lower() in ("1", "true", "yes")
 
 params = initial_params
@@ -261,18 +307,20 @@ print(
 
 @jax.jit
 def objective_and_grad(params):
-    return value_and_grad(compute_objective_mlp)(params)
+    return value_and_grad(compute_objective_mlp, has_aux=True)(params)
 
 
 for iteration in range(n_iterations):
     iter_start = pytime.time()
     print(f"Iteration {iteration + 1}/{n_iterations}")
-    obj_val, grad_params = objective_and_grad(params)
+
+    (obj_val, (focal_rms, contrast, focal_energy_frac, rms_shell)), grad_params = objective_and_grad(params)
+    print(f"  Loss: {float(obj_val):.4f} | focal_rms={float(focal_rms):.4f} | rms_shell={float(rms_shell):.4f} | contrast={float(contrast):.3f} | energy_frac={float(focal_energy_frac):.5f}")
+
     obj_float = float(obj_val)
     grad_norm = jnp.sqrt(
         sum(jnp.sum(jnp.square(g)) for (W, b) in grad_params for g in [W, b])
     )
-    print(f"  Loss: {obj_val:.6f}, RMS |P|: {-obj_val:.6f} Pa")
 
     if obj_float < best_objective:
         best_objective = obj_float
@@ -288,9 +336,6 @@ for iteration in range(n_iterations):
     print(f"  Time: {optimization_history['iteration_times'][-1]:.2f} s")
 
 final_params = best_params
-first_rms = optimization_history["pressures"][0]
-print(f"\nBest iter {best_iteration}, RMS |P| {-best_objective:.6f} Pa")
-print(f"Improvement: {(-best_objective / max(first_rms, 1e-10) - 1) * 100:.1f}%")
 
 print("\n" + "=" * 70)
 print("VALIDATION")
@@ -303,7 +348,7 @@ n_sphere_pts = np.sum(sphere_mask_np)
 
 
 def run_val(pp):
-    ss, dd = material_field_from_mlp(pp)
+    ss, dd, _ = material_field_from_mlp(pp)
     med = create_medium_from_material_field(domain, ss, dd)
     p_complex = run_helmholtz(med)
     return np.array(jnp.abs(p_complex.on_grid[..., 0]))
@@ -312,15 +357,29 @@ def run_val(pp):
 print("Running initial config...")
 p_init = run_val(initial_params)
 rms_init_val = np.sqrt(np.sum((p_init * sphere_mask_np) ** 2) / max(n_sphere_pts, 1))
-print(f"  RMS |P|: {rms_init_val:.6f} Pa")
+mean_rms_init = np.sqrt(np.mean(p_init**2) + 1e-20)
+contrast_init = rms_init_val / mean_rms_init
+print(f"  RMS |P|: {rms_init_val:.6f} Pa | contrast: {contrast_init:.3f}")
+
+# Verify focal center is inside pressure field
+fc = target_focal_center
+print(f"  Pressure at focal center: {float(p_init[fc[0], fc[1], fc[2]]):.4f}")
+max_idx = np.unravel_index(np.argmax(p_init), p_init.shape)
+print(f"  Pressure field max location: {max_idx}")
+print(f"  Focal sphere volume: {float(np.sum(sphere_mask_np)):.0f} voxels")
 
 print("Running optimized config...")
 p_opt = run_val(final_params)
 rms_opt_val = np.sqrt(np.sum((p_opt * sphere_mask_np) ** 2) / max(n_sphere_pts, 1))
-print(f"  RMS |P|: {rms_opt_val:.6f} Pa")
+mean_rms_opt = np.sqrt(np.mean(p_opt**2) + 1e-20)
+contrast_opt = rms_opt_val / mean_rms_opt
+print(f"  RMS |P|: {rms_opt_val:.6f} Pa | contrast: {contrast_opt:.3f}")
 
 improvement_full = (rms_opt_val / max(rms_init_val, 1e-10) - 1) * 100
-print(f"  Improvement: {improvement_full:.1f}%")
+contrast_improvement = (contrast_opt / max(contrast_init, 1e-10) - 1) * 100
+
+print(f"\nBest iter {best_iteration}, RMS |P| {rms_opt_val:.6f} Pa, contrast {contrast_opt:.3f}")
+print(f"Improvement: RMS +{improvement_full:.1f}% | contrast +{contrast_improvement:.1f}%")
 
 # ---------- Visualization (same layout as time-domain script) ----------
 slice_z = int(target_focal_center[2])
@@ -447,8 +506,8 @@ Layers: {siren_layer_sizes}, ω₀={siren_omega0}
 Solver: Helmholtz (single frequency)
 
 Results:
-  Initial RMS |P|: {rms_init_val:.6f} Pa
-  Optimized RMS |P|: {rms_opt_val:.6f} Pa
+  Initial: {rms_init_val:.6f} Pa
+  Optimized: {rms_opt_val:.6f} Pa
   Improvement: {improvement_full:.1f}%
 """
 ax.text(
@@ -554,6 +613,8 @@ def plot_alpha_slice_row(axes_row, alpha_data, label):
     axes_row[2].set_ylabel("z (mm)")
     axes_row[2].set_title(f"{label} — YZ slice")
     plt.colorbar(im, ax=axes_row[2], label="α", fraction=0.046)
+
+
 
 
 plot_alpha_slice_row(axes3[0], alpha_init, "Initial")
