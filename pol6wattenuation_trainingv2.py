@@ -117,6 +117,133 @@ def _available_memory_bytes() -> int:
 _HELMHOLTZ_BYTES_PER_VOXEL = 350
 
 
+def _design_band_indices_from_fracs(n: int, lo_frac: float, hi_frac: float) -> Tuple[int, int]:
+    """Clamp fractional band [lo_frac, hi_frac) to valid voxel indices in [0, n]."""
+    lo = max(0.0, min(1.0, float(lo_frac)))
+    hi = max(0.0, min(1.0, float(hi_frac)))
+    if hi <= lo:
+        hi = min(1.0, lo + 1e-6)
+    j_lo = max(0, int(lo * n))
+    j_hi = min(n, int(hi * n))
+    if j_hi <= j_lo:
+        j_hi = min(n, j_lo + 1)
+    return j_lo, j_hi
+
+
+def _orange_mask_full_volume(
+    nx: int,
+    ny: int,
+    nz: int,
+    x_surf: Optional[np.ndarray],
+    nx_post: int,
+    design_j_lo: int,
+    design_j_hi: int,
+    design_k_lo: int,
+    design_k_hi: int,
+    source_x_slices_int: int,
+    lens_depth_vox: int,
+    fallback_x0: int,
+    fallback_x1: int,
+) -> np.ndarray:
+    """Boolean (nx,ny,nz): True = lens / SIREN design voxels (coupling slab in front of skull).
+
+    Lateral extent is limited by the design band [design_j_lo:design_j_hi] etc.
+    When ``x_surf`` is None, fills the fallback x-slab in that band (legacy no-segmentation).
+    """
+    m = np.zeros((nx, ny, nz), dtype=bool)
+    if x_surf is not None:
+        ii = np.arange(nx, dtype=np.float64)[:, None, None]
+        left_b = np.maximum(
+            float(source_x_slices_int),
+            x_surf[None, :, :] - float(lens_depth_vox),
+        )
+        in_lens = (ii >= left_b) & (ii < x_surf[None, :, :])
+        has_tissue = x_surf[None, :, :] < float(nx_post)
+        m = (in_lens & has_tissue)
+        m[:, :design_j_lo, :] = False
+        m[:, design_j_hi:, :] = False
+        m[:, :, :design_k_lo] = False
+        m[:, :, design_k_hi:] = False
+    else:
+        if fallback_x1 > fallback_x0:
+            m[fallback_x0:fallback_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] = True
+    return m
+
+
+def _tight_bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int, int, int, int, int]]:
+    """Return (i0, i1, j0, j1, k0, k1) exclusive upper bounds, or None if mask is empty."""
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    i0, j0, k0 = coords.min(axis=0)
+    i1, j1, k1 = coords.max(axis=0)
+    return int(i0), int(i1) + 1, int(j0), int(j1) + 1, int(k0), int(k1) + 1
+
+
+# ---------------------------------------------------------------------------
+# Transducer specifications — Jimenez-Gambin et al. 2019
+# Single-element flat circular PZT-26 piezoceramic, 50 mm aperture, 1.112 MHz.
+# The nominal frequency is stored only for a warning when the simulation
+# frequency deviates >10%; dx and frequency are always taken from the CLI args.
+# ---------------------------------------------------------------------------
+_TRANSDUCER_RADIUS_MM = 25.0    # 50 mm diameter → 25 mm radius
+_TRANSDUCER_FREQ_HZ   = 1.112e6 # nominal spec (warning reference only)
+
+
+def _make_transducer_source(
+    nxyz: Tuple[int, int, int],
+    dx_mm: float,
+    domain,
+    frequency_hz: float,
+    source_x_slice: int = 0,
+) -> "FourierSeries":
+    """
+    Single-element flat circular PZT-26 transducer.
+    Jimenez-Gambin et al. 2019 — 50 mm aperture, uniform phase.
+    Focusing is done entirely by the external acoustic holographic lens (SIREN).
+    dx and frequency are taken from the simulation arguments, not hardcoded.
+    """
+    nx, ny, nz = nxyz
+
+    if abs(frequency_hz - _TRANSDUCER_FREQ_HZ) / _TRANSDUCER_FREQ_HZ > 0.1:
+        print(
+            f"[warn] Simulation frequency {frequency_hz / 1e6:.3f} MHz differs >10% "
+            f"from transducer spec {_TRANSDUCER_FREQ_HZ / 1e6:.3f} MHz "
+            f"(Jimenez-Gambin 2019 PZT-26)."
+        )
+
+    radius_vox    = _TRANSDUCER_RADIUS_MM / dx_mm
+    domain_half_y = (ny / 2.0) * dx_mm
+    domain_half_z = (nz / 2.0) * dx_mm
+
+    if _TRANSDUCER_RADIUS_MM > min(domain_half_y, domain_half_z):
+        print(
+            f"[warn] Transducer radius {_TRANSDUCER_RADIUS_MM:.1f} mm exceeds domain "
+            f"half-width ({min(domain_half_y, domain_half_z):.1f} mm). "
+            f"Aperture will be clipped by domain boundary."
+        )
+
+    cy = ny / 2.0
+    cz = nz / 2.0
+    yy = jnp.arange(ny, dtype=jnp.float32) - cy
+    zz = jnp.arange(nz, dtype=jnp.float32) - cz
+    YY, ZZ = jnp.meshgrid(yy, zz, indexing="ij")
+    r2       = YY ** 2 + ZZ ** 2
+    aperture = (r2 <= radius_vox ** 2).astype(jnp.float32)
+
+    n_active = int(jnp.sum(aperture))
+    print(
+        f"[source] PZT-26 transducer (Jimenez-Gambin 2019): "
+        f"radius={_TRANSDUCER_RADIUS_MM:.1f} mm = {radius_vox:.1f} vox, "
+        f"active={n_active} of {ny * nz} px ({100 * n_active / (ny * nz):.1f}%), "
+        f"x_slice={source_x_slice}, freq={frequency_hz/1e3:.0f} kHz, dx={dx_mm:.3f} mm"
+    )
+
+    src = jnp.zeros((nx, ny, nz, 1), dtype=jnp.complex64)
+    src = src.at[source_x_slice, :, :, 0].set(aperture.astype(jnp.complex64))
+    return FourierSeries(src, domain)
+
+
 # ---------------------------------------------------------------------------
 # Trainable SIREN MLP + optimization helpers
 # ---------------------------------------------------------------------------
@@ -154,14 +281,12 @@ def _siren_apply(params: list[Tuple[jax.Array, jax.Array]], xyz: jax.Array, omeg
     return jax.nn.sigmoid(jnp.squeeze(out, axis=-1))
 
 
-def _focus_sphere_mask(
-    shape: Tuple[int, int, int],
-    radius_vox: int,
-    center: Optional[Tuple[int, int, int]] = None,
-) -> np.ndarray:
-    """3D sphere mask around a given voxel center (defaults to volume center)."""
+def _focus_sphere_mask(shape: Tuple[int, int, int], radius_vox: int) -> np.ndarray:
+    """3D sphere mask around volume center (matches red-circle center in slice plots)."""
     nx, ny, nz = shape
-    cx, cy, cz = center if center is not None else (nx // 2, ny // 2, nz // 2)
+    # Shift the sphere centre away from the exact mid-plane.
+    # Use /2.2 (floored to int) for safe integer voxel indexing.
+    cx, cy, cz = int(nx / 1.5), int(ny / 1.5), int(nz / 2.0)
     x = np.arange(nx, dtype=np.int32)[:, None, None]
     y = np.arange(ny, dtype=np.int32)[None, :, None]
     z = np.arange(nz, dtype=np.int32)[None, None, :]
@@ -172,12 +297,7 @@ def _focus_sphere_mask(
 def optimize_lens_with_siren(
     c_base: np.ndarray,
     rho_base: np.ndarray,
-    lens_x0: int,
-    lens_x1: int,
-    design_j_lo: int,
-    design_j_hi: int,
-    design_k_lo: int,
-    design_k_hi: int,
+    orange_mask_full: np.ndarray,
     dx_mm: float,
     frequency_hz: float,
     source_x_slices: int,
@@ -196,81 +316,69 @@ def optimize_lens_with_siren(
     rho_solid: float,
     focus_radius_mm: float,
     use_jit: bool,
-    x_surf: Optional[np.ndarray] = None,
-    nx_post: int = 0,
-    focus_centers_vox: Optional[list] = None,
-    results_log_path: Optional[Path] = None,
+    use_transducer_source: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, list[float]]:
     """
-    End-to-end differentiable pipeline:
-      Design region = [lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] (e.g. CT + 75%% y/z).
-      (x,y,z) -> SIREN -> alpha -> material in that box -> Helmholtz -> negative RMS at focus -> backprop.
-    No clamp is applied inside the lens design space.
+    End-to-end differentiable pipeline: SIREN only edits voxels where ``orange_mask_full`` is True
+    (the orange coupling slab). No separate logical bounding box — indices come from this mask.
     """
-    if lens_x1 <= lens_x0 or design_j_hi <= design_j_lo or design_k_hi <= design_k_lo:
-        print("[warn] Empty lens design region; skipping optimization.")
+    nx, ny, nz = c_base.shape
+    if orange_mask_full.shape != (nx, ny, nz):
+        print(f"[warn] orange_mask_full shape {orange_mask_full.shape} != c_base {c_base.shape}; skipping optimization.")
+        return c_base, rho_base, []
+    if not np.any(orange_mask_full):
+        print("[warn] Empty orange mask; skipping optimization.")
         return c_base, rho_base, []
 
-    nx, ny, nz = c_base.shape
-    lx = lens_x1 - lens_x0
-    ly = design_j_hi - design_j_lo
-    lz = design_k_hi - design_k_lo
-    xs = np.linspace(-1.0, 1.0, lx, dtype=np.float32)
-    ys = np.linspace(-1.0, 1.0, ly, dtype=np.float32)
-    zs = np.linspace(-1.0, 1.0, lz, dtype=np.float32)
-    xg, yg, zg = np.meshgrid(xs, ys, zs, indexing="ij")
-    lens_xyz_full = np.stack([xg.ravel(), yg.ravel(), zg.ravel()], axis=1)
+    ii, jj, kk = np.nonzero(orange_mask_full)
+    n_orange = int(ii.size)
+    # Normalized coords in [-1,1] from tight bbox of orange (conditions SIREN).
+    i_min, i_max = float(ii.min()), float(ii.max())
+    j_min, j_max = float(jj.min()), float(jj.max())
+    k_min, k_max = float(kk.min()), float(kk.max())
+    den_i = max(i_max - i_min, 1.0)
+    den_j = max(j_max - j_min, 1.0)
+    den_k = max(k_max - k_min, 1.0)
+    xi = (2.0 * (ii.astype(np.float64) - i_min) / den_i - 1.0).astype(np.float32)
+    yj = (2.0 * (jj.astype(np.float64) - j_min) / den_j - 1.0).astype(np.float32)
+    zk = (2.0 * (kk.astype(np.float64) - k_min) / den_k - 1.0).astype(np.float32)
+    lens_xyz = np.stack([xi, yj, zk], axis=1)
 
     c_base_j = jnp.asarray(c_base, dtype=jnp.float32)
     rho_base_j = jnp.asarray(rho_base, dtype=jnp.float32)
 
-    # Orange polygon mask: i < x_surf(j,k) or i == lens_x0 (left edge) so corners are filled; exclude background.
-    design_region_mask_j = None
-    lens_xyz_j = jnp.asarray(lens_xyz_full, dtype=jnp.float32)
-    orange_flat_indices = None
-    if x_surf is not None and nx_post > 0:
-        x_surf_slice = x_surf[design_j_lo:design_j_hi, design_k_lo:design_k_hi]
-        ii_idx = np.arange(lx, dtype=np.float64) + lens_x0
-        in_front = ii_idx[:, None, None] < x_surf_slice[None, :, :]
-        left_edge = (ii_idx == lens_x0)[:, None, None]
-        has_tissue = (x_surf_slice < nx_post)[None, :, :]
-        design_region_mask = (in_front | left_edge) & has_tissue
-        design_region_mask_j = jnp.asarray(design_region_mask)
-        n_design = int(np.sum(design_region_mask))
-        print(f"[opt] Design restricted to orange polygon: {n_design} voxels (of {lx*ly*lz} in box).")
-        # SIREN inputs: only orange voxels
-        orange_flat_indices = np.flatnonzero(design_region_mask)
-        lens_xyz_j = jnp.asarray(lens_xyz_full[orange_flat_indices], dtype=jnp.float32)
-    clamp_exempt_mask = np.zeros((nx, ny, nz), dtype=bool)
-    if design_region_mask_j is not None:
-        clamp_exempt_mask[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] = np.array(design_region_mask_j)
-    else:
-        clamp_exempt_mask[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] = True
-    clamp_exempt_j = jnp.asarray(clamp_exempt_mask)
+    lens_xyz_j = jnp.asarray(lens_xyz, dtype=jnp.float32)
+    ii_i = jnp.asarray(ii.astype(np.int32))
+    jj_i = jnp.asarray(jj.astype(np.int32))
+    kk_i = jnp.asarray(kk.astype(np.int32))
+
+    print(
+        f"[opt] SIREN design: {n_orange:,} orange voxels only (no separate logical box). "
+        f"Skull/brain CT frozen outside orange."
+    )
+
+    clamp_exempt_j = jnp.asarray(orange_mask_full.astype(np.bool_))
 
     focus_radius_vox = max(1, int(round(focus_radius_mm / dx_mm)))
-
-    # Build per-focus masks. Default: single focus at volume center.
-    if focus_centers_vox is None or len(focus_centers_vox) == 0:
-        focus_centers_vox = [(nx // 2, ny // 2, nz // 2)]
-
-    n_foci = len(focus_centers_vox)
-    focus_masks_np = [
-        _focus_sphere_mask((nx, ny, nz), radius_vox=focus_radius_vox, center=tuple(c)).astype(np.float32)
-        for c in focus_centers_vox
-    ]
-    focus_masks_j = [jnp.asarray(m, dtype=jnp.float32) for m in focus_masks_np]
-    focus_mask_sums_j = [jnp.maximum(jnp.sum(m), 1.0) for m in focus_masks_j]
-    print(f"[opt] Foci: {n_foci}  centers={focus_centers_vox}  radius={focus_radius_vox} vox ({focus_radius_mm:.1f} mm)")
-    for i, m in enumerate(focus_masks_np):
-        print(f"[opt]   Focus {i+1}: {int(m.sum())} voxels")
+    focus_mask = _focus_sphere_mask((nx, ny, nz), radius_vox=focus_radius_vox).astype(np.float32)
+    focus_mask_j = jnp.asarray(focus_mask, dtype=jnp.float32)
+    focus_mask_sum = jnp.maximum(jnp.sum(focus_mask_j), 1.0)
 
     nxyz = (nx, ny, nz)
     dx_m = dx_mm * 1e-3
     domain = Domain(nxyz, (dx_m, dx_m, dx_m))
-    src = jnp.zeros((nx, ny, nz, 1), dtype=jnp.complex64)
-    src = src.at[:source_x_slices, :, :, 0].set(1.0 + 0.0j)
-    source = FourierSeries(src, domain)
+    if use_transducer_source:
+        source = _make_transducer_source(
+            nxyz=nxyz,
+            dx_mm=dx_mm,
+            domain=domain,
+            frequency_hz=frequency_hz,
+            source_x_slice=source_x_slices - 1,
+        )
+    else:
+        src = jnp.zeros((nx, ny, nz, 1), dtype=jnp.complex64)
+        src = src.at[:source_x_slices, :, :, 0].set(1.0 + 0.0j)
+        source = FourierSeries(src, domain)
     omega = 2.0 * jnp.pi * frequency_hz
     pml = max(10, min(32, min(nxyz) // 8))
 
@@ -282,28 +390,11 @@ def optimize_lens_with_siren(
     history: list[float] = []
 
     def _loss_fn(p):
-        alpha_masked = _siren_apply(p, lens_xyz_j, omega0=omega0)
-        if design_region_mask_j is not None:
-            # Scatter SIREN output into full box (unmasked positions ignored via jnp.where below)
-            alpha_full_flat = jnp.zeros(lx * ly * lz).at[orange_flat_indices].set(alpha_masked)
-            alpha = alpha_full_flat.reshape((lx, ly, lz))
-        else:
-            alpha = alpha_masked.reshape((lx, ly, lz))
-
-        c_lens = c_water + alpha * (c_solid - c_water)
-        rho_lens = rho_water + alpha * (rho_solid - rho_water)
-        if design_region_mask_j is not None:
-            c_slice = c_base_j[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi]
-            rho_slice = rho_base_j[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi]
-            c_new = jnp.where(design_region_mask_j, c_lens, c_slice)
-            rho_new = jnp.where(design_region_mask_j, rho_lens, rho_slice)
-            c_now = c_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(c_new)
-            rho_now = rho_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(rho_new)
-        else:
-            c_now = c_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(c_lens)
-            rho_now = rho_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(rho_lens)
-
-        # Clamp only outside design space; keep design space unclamped.
+        alpha = _siren_apply(p, lens_xyz_j, omega0=omega0)
+        c_orange = c_water + alpha * (c_solid - c_water)
+        rho_orange = rho_water + alpha * (rho_solid - rho_water)
+        c_now = c_base_j.at[ii_i, jj_i, kk_i].set(c_orange)
+        rho_now = rho_base_j.at[ii_i, jj_i, kk_i].set(rho_orange)
         c_now = jnp.where((c_now < c_water) & (~clamp_exempt_j), c_water, c_now)
         rho_now = jnp.where((rho_now < rho_water) & (~clamp_exempt_j), rho_water, rho_now)
 
@@ -327,17 +418,11 @@ def optimize_lens_with_siren(
         )
         print(f"[opt] Helmholtz solve time: {time.time() - t0:.3f}s")
         p_abs = jnp.abs(p_complex.on_grid[..., 0])
-        p_sq = p_abs ** 2
-        # Per-focus RMS; loss = mean across all foci
-        per_focus_rms = [
-            jnp.sqrt(jnp.sum(p_sq * focus_masks_j[i]) / (2.0 * focus_mask_sums_j[i]) + 1e-20)
-            for i in range(n_foci)
-        ]
-        avg_rms = sum(per_focus_rms) / n_foci
-        loss = -avg_rms
-        alpha_min = jnp.min(alpha_masked)
-        alpha_max = jnp.max(alpha_masked)
-        return loss, (avg_rms, alpha_min, alpha_max, *per_focus_rms)
+        rms = jnp.sqrt(jnp.sum((p_abs ** 2) * focus_mask_j) / (2.0 * focus_mask_sum) + 1e-20)
+        loss = -rms
+        alpha_min = jnp.min(alpha)
+        alpha_max = jnp.max(alpha)
+        return loss, (rms, alpha_min, alpha_max)
 
     step_fn = value_and_grad(_loss_fn, has_aux=True)
     if use_jit:
@@ -347,105 +432,42 @@ def optimize_lens_with_siren(
     opt_state = optimizer.init(params)
 
     print(f"[opt] Lens optimization start: steps={n_steps}, lr={lr:.3e} (Adam), hidden={hidden}, depth={depth}, omega0={omega0}")
-    print(f"[opt] Design region: x=[{lens_x0}:{lens_x1}] ({lx} vox), y=[{design_j_lo}:{design_j_hi}] ({ly}), z=[{design_k_lo}:{design_k_hi}] ({lz}), focus radius={focus_radius_vox} vox")
-
-    # Open results log file (append mode so multiple runs accumulate).
-    log_fh = None
-    if results_log_path is not None:
-        log_fh = open(results_log_path, "a", buffering=1)
-        import datetime
-        log_fh.write(f"\n{'='*70}\n")
-        log_fh.write(f"RUN START: {datetime.datetime.now().isoformat()}\n")
-        log_fh.write(f"frequency_hz: {frequency_hz}\n")
-        log_fh.write(f"dx_mm: {dx_mm}\n")
-        log_fh.write(f"domain_shape: ({nx}, {ny}, {nz})\n")
-        log_fh.write(f"n_foci: {n_foci}\n")
-        for i, c in enumerate(focus_centers_vox):
-            log_fh.write(f"focus_{i+1}_vox: {c}\n")
-        log_fh.write(f"focus_radius_mm: {focus_radius_mm}  radius_vox: {focus_radius_vox}\n")
-        log_fh.write(f"n_steps: {n_steps}  lr: {lr}  hidden: {hidden}  depth: {depth}  omega0: {omega0}\n")
-        log_fh.write(f"lens_x: [{lens_x0}:{lens_x1}]  y: [{design_j_lo}:{design_j_hi}]  z: [{design_k_lo}:{design_k_hi}]\n")
-        log_fh.write(f"{'='*70}\n")
-        # Header row
-        focus_cols = "  ".join(f"rms_f{i+1}" for i in range(n_foci))
-        log_fh.write(f"step  loss        avg_rms     {focus_cols}  alpha_min  alpha_max  elapsed_s\n")
-        log_fh.flush()
-
-    rms_first_run = None  # track for improvement %
+    print(
+        f"[opt] Orange mask only (tight): x=[{int(ii.min())}:{int(ii.max()) + 1}], "
+        f"y=[{int(jj.min())}:{int(jj.max()) + 1}], z=[{int(kk.min())}:{int(kk.max()) + 1}], "
+        f"focus radius={focus_radius_vox} vox"
+    )
     for step in range(1, n_steps + 1):
         t0 = time.time()
         (loss, aux), grads = step_fn(params)
-        elapsed = time.time() - t0
-        print(f"[opt] Step time time: {elapsed:.3f}s")
-        avg_rms = aux[0]
-        a_min, a_max = aux[1], aux[2]
-        per_focus_rms_vals = [float(aux[3 + i]) for i in range(n_foci)]
+        print(f"[opt] Step time time: {time.time() - t0:.3f}s")
+        rms, a_min, a_max = aux
         updates, opt_state = optimizer.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
         loss_f = float(loss)
-        rms_f = float(avg_rms)
-        if rms_first_run is None:
-            rms_first_run = rms_f
+        rms_f = float(rms)
         history.append(loss_f)
-        focus_rms_str = "  ".join(f"{v:.4e}" for v in per_focus_rms_vals)
         print(
             f"[opt] step {step:03d}/{n_steps:03d} "
-            f"loss={loss_f:.4e} avg_rms={rms_f:.4e} "
-            f"[{focus_rms_str}] "
-            f"alpha=[{float(a_min):.3f},{float(a_max):.3f}] "
-            f"dt={elapsed:.1f}s"
+            f"loss={loss_f:.4e} focus_rms={rms_f:.4e} alpha=[{float(a_min):.3f},{float(a_max):.3f}] "
+            f"dt={time.time() - t0:.1f}s"
         )
-        if log_fh is not None:
-            focus_log_cols = "  ".join(f"{v:.6e}" for v in per_focus_rms_vals)
-            log_fh.write(
-                f"{step:04d}  {loss_f:+.6e}  {rms_f:.6e}  {focus_log_cols}"
-                f"  {float(a_min):.4f}     {float(a_max):.4f}     {elapsed:.2f}\n"
-            )
-            log_fh.flush()
 
-    if log_fh is not None:
-        improvement_pct = (rms_f / max(rms_first_run, 1e-30) - 1.0) * 100.0 if rms_first_run else 0.0
-        log_fh.write(f"{'='*70}\n")
-        log_fh.write(f"OPTIMIZATION COMPLETE: {n_steps} steps\n")
-        log_fh.write(f"initial_avg_rms: {rms_first_run:.6e}\n")
-        log_fh.write(f"final_avg_rms:   {rms_f:.6e}\n")
-        log_fh.write(f"improvement:     {improvement_pct:+.1f}%\n")
-        log_fh.write(f"{'='*70}\n")
-        log_fh.close()
-
-    alpha_masked_final = _siren_apply(params, lens_xyz_j, omega0=omega0)
-    if design_region_mask_j is not None:
-        alpha_full_flat = jnp.zeros(lx * ly * lz).at[orange_flat_indices].set(alpha_masked_final)
-        alpha_final = alpha_full_flat.reshape((lx, ly, lz))
-    else:
-        alpha_final = alpha_masked_final.reshape((lx, ly, lz))
-    c_lens_final = c_water + alpha_final * (c_solid - c_water)
-    rho_lens_final = rho_water + alpha_final * (rho_solid - rho_water)
-    if design_region_mask_j is not None:
-        c_slice = c_base_j[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi]
-        rho_slice = rho_base_j[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi]
-        c_final = c_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(
-            jnp.where(design_region_mask_j, c_lens_final, c_slice)
-        )
-        rho_final = rho_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(
-            jnp.where(design_region_mask_j, rho_lens_final, rho_slice)
-        )
-    else:
-        c_final = c_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(c_lens_final)
-        rho_final = rho_base_j.at[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].set(rho_lens_final)
+    alpha_final = _siren_apply(params, lens_xyz_j, omega0=omega0)
+    c_final_orange = c_water + alpha_final * (c_solid - c_water)
+    rho_final_orange = rho_water + alpha_final * (rho_solid - rho_water)
+    c_final = c_base_j.at[ii_i, jj_i, kk_i].set(c_final_orange)
+    rho_final = rho_base_j.at[ii_i, jj_i, kk_i].set(rho_final_orange)
     c_final_np = np.array(c_final, dtype=np.float32)
     rho_final_np = np.array(rho_final, dtype=np.float32)
-    box_slice = (slice(lens_x0, lens_x1), slice(design_j_lo, design_j_hi), slice(design_k_lo, design_k_hi))
-    if design_region_mask_j is not None:
-        c_des = c_final_np[box_slice][np.array(design_region_mask_j)]
-        rho_des = rho_final_np[box_slice][np.array(design_region_mask_j)]
-    else:
-        c_des = c_final_np[box_slice]
-        rho_des = rho_final_np[box_slice]
+
+    # Stats on orange polygon voxels only
+    c_orange_np   = float(c_water)   + np.array(alpha_final) * (c_solid   - float(c_water))
+    rho_orange_np = float(rho_water) + np.array(alpha_final) * (rho_solid - float(rho_water))
     print(
-        f"[opt] Final lens material range (orange region): "
-        f"c=[{float(np.min(c_des)):.1f}, {float(np.max(c_des)):.1f}] m/s, "
-        f"rho=[{float(np.min(rho_des)):.1f}, {float(np.max(rho_des)):.1f}] kg/m^3"
+        f"[opt] Final lens material range (orange polygon, {n_orange:,} vox): "
+        f"c=[{float(np.min(c_orange_np)):.1f}, {float(np.max(c_orange_np)):.1f}] m/s, "
+        f"rho=[{float(np.min(rho_orange_np)):.1f}, {float(np.max(rho_orange_np)):.1f}] kg/m^3"
     )
     return c_final_np, rho_final_np, history
 
@@ -681,6 +703,7 @@ def solve_helmholtz(
     checkpoint: bool,
     clamp_exempt_mask: Optional[np.ndarray] = None,
     att_xyz: Optional[np.ndarray] = None,
+    use_transducer_source: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     # Clamp background/air voxels to water-like values.
     # CT-derived maps have c≈0 and ρ≈0 for air/background; these produce
@@ -726,13 +749,18 @@ def solve_helmholtz(
     else:
         medium = Medium(domain=domain, sound_speed=c_j, density=rho_j, pml_size=pml)
 
-    # Real-valued unit source across the first source_x_slices planes.
-    # Using -1.0j (pure imaginary) previously produced a 90° phase-shifted
-    # forcing that confused the solver; a real source with PML boundaries
-    # produces a coherent pseudo-traveling wave in the +x direction.
-    src = jnp.zeros((*nxyz, 1), dtype=jnp.complex64)
-    src = src.at[:source_x_slices, :, :, 0].set(1.0 + 0.0j)
-    source = FourierSeries(src, domain)
+    if use_transducer_source:
+        source = _make_transducer_source(
+            nxyz=nxyz,
+            dx_mm=dx_mm,
+            domain=domain,
+            frequency_hz=frequency_hz,
+            source_x_slice=source_x_slices - 1,
+        )
+    else:
+        src = jnp.zeros((*nxyz, 1), dtype=jnp.complex64)
+        src = src.at[:source_x_slices, :, :, 0].set(1.0 + 0.0j)
+        source = FourierSeries(src, domain)
 
     omega = 2.0 * jnp.pi * frequency_hz
     c_mean = float(jnp.mean(c_j))
@@ -799,8 +827,8 @@ def plot_slices(
     bath_partition_fracs: Tuple[float, float] = (1.0/3.0, 2.0/3.0),
     c_full: Optional[np.ndarray] = None,
     design_region_vox: Optional[Tuple[int, int, int, int, int, int]] = None,
-    focus_centers_vox: Optional[list] = None,
-    focus_radius_mm: float = 4.0,
+    lens_depth_vox: int = 0,
+    lens_left_min_x: int = 0,
 ) -> None:
     nx, ny, nz = p_abs.shape
     body_mask_full = body_mask  # full domain for design region / skull surface (before crop alias)
@@ -845,9 +873,13 @@ def plot_slices(
             f"Peak is {pct_disp:.0f}% along displayed region "
             f"({'near LEFT/source' if pct_disp < 20 else 'near RIGHT/far end' if pct_disp > 80 else 'middle'})."
         )
-    xmid = nd_x // 2
-    ymid = ny // 2
-    zmid = nz // 2
+    # Match the focus sphere center shift (/2.2) used for focus_mask/metrics.
+    # Note: xmid is in the *cropped display* coordinates (after p_abs[x0:]).
+    xmid_full = int(nx / 1.5)
+    xmid = int(xmid_full - x0)
+    xmid = int(np.clip(xmid, 0, nd_x - 1))
+    ymid = int(ny / 1.5)
+    zmid = int(nz / 2.0)
 
     # Extents in mm: x-axis starts at x0*dx_mm offset from domain origin.
     x_off = x0 * dx_mm
@@ -909,7 +941,6 @@ def plot_slices(
     vmin_log = max(1e-12, vmax / 1e5)
 
     # Full-domain planes (including water bath) so boundary lines are visible inside the plot
-    xmid_full = nx // 2
     planes_full = [p_abs[:, :, zmid].T, p_abs[:, ymid, :].T, p_abs[xmid_full, :, :].T]
     planes_full_rms = [
         (p_abs[:, :, zmid] / np.sqrt(2.0)).T,
@@ -996,103 +1027,213 @@ def plot_slices(
         ax.text(water_bath_boundary_mm + (ct_end_mm - water_bath_boundary_mm) / 2.0, ymid_ax, "CT", color="gray", ha="center", va="center", fontsize=8)
 
     def _add_design_subbox(ax, col_idx: int):
-        """Draw the lens design region: rectangle when design_region_vox given, else curved right edge if x_surf available."""
+        """Draw the lens design region.
+
+        XY / XZ: coupling layer with **left** edge ``max(lens_left_min_x, x_surf−depth)`` per column
+        (matches the orange mask), **right** edge ``x_surf``. Not a single vertical at ``lens_x0``,
+        so top/bottom left corners close correctly when the skull curve is oblique.
+
+        YZ: unchanged rectangle over the y/z design band at ``x = xmid_full`` (as requested).
+        """
         from matplotlib.patches import Rectangle, Polygon
+
+        def _contiguous_runs_1d(j_lo: int, j_hi: int, valid: np.ndarray) -> list[tuple[int, int]]:
+            """Indices inclusive [j_lo, j_hi] where valid[j] is True; return list of (ja, jb)."""
+            runs: list[tuple[int, int]] = []
+            ja = None
+            jb = None
+            for j in range(j_lo, j_hi + 1):
+                if bool(valid[j]):
+                    if ja is None:
+                        ja = j
+                    jb = j
+                else:
+                    if ja is not None and jb is not None:
+                        runs.append((ja, jb))
+                        ja = None
+                        jb = None
+            if ja is not None and jb is not None:
+                runs.append((ja, jb))
+            return runs
+
+        def _poly_xy(ja: int, jb: int):
+            # Left boundary varies per j (matches orange_mask): max(source, skull−depth).
+            # A single vertical at design_start_x leaves empty wedges at top/bottom "left corners".
+            if lens_depth_vox > 0:
+                left_x = np.maximum(
+                    float(lens_left_min_x),
+                    x_surf[:, zmid].astype(np.float64) - float(lens_depth_vox),
+                )
+                verts = []
+                for j in range(ja, jb + 1):
+                    verts.append((float(left_x[j]) * dx_mm, j * dx_mm))
+                for j in range(jb, ja - 1, -1):
+                    verts.append((float(x_surf[j, zmid]) * dx_mm, j * dx_mm))
+                return verts
+            verts = [
+                (design_start_x, ja * dx_mm),
+                (design_start_x, jb * dx_mm),
+                (float(x_surf[jb, zmid]) * dx_mm, jb * dx_mm),
+            ]
+            for j in range(jb - 1, ja - 1, -1):
+                verts.append((float(x_surf[j, zmid]) * dx_mm, j * dx_mm))
+            verts.append((float(x_surf[ja, zmid]) * dx_mm, ja * dx_mm))
+            verts.append((design_start_x, ja * dx_mm))
+            return verts
+
+        def _poly_xz(ka: int, kb: int):
+            if lens_depth_vox > 0:
+                left_z = np.maximum(
+                    float(lens_left_min_x),
+                    x_surf[ymid, :].astype(np.float64) - float(lens_depth_vox),
+                )
+                verts = []
+                for k in range(ka, kb + 1):
+                    verts.append((float(left_z[k]) * dx_mm, k * dx_mm))
+                for k in range(kb, ka - 1, -1):
+                    verts.append((float(x_surf[ymid, k]) * dx_mm, k * dx_mm))
+                return verts
+            verts = [
+                (design_start_x, ka * dx_mm),
+                (design_start_x, kb * dx_mm),
+                (float(x_surf[ymid, kb]) * dx_mm, kb * dx_mm),
+            ]
+            for k in range(kb - 1, ka - 1, -1):
+                verts.append((float(x_surf[ymid, k]) * dx_mm, k * dx_mm))
+            verts.append((float(x_surf[ymid, ka]) * dx_mm, ka * dx_mm))
+            verts.append((design_start_x, ka * dx_mm))
+            return verts
+
+        patches: list = []
+
         if col_idx == 0:
             if use_design_rect:
-                patch = Rectangle(
-                    (design_start_x, design_y_lo), design_len_x, design_y_hi - design_y_lo,
-                    fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)",
+                patches.append(
+                    Rectangle(
+                        (design_start_x, design_y_lo),
+                        design_len_x,
+                        design_y_hi - design_y_lo,
+                        fill=False,
+                        edgecolor="orange",
+                        linewidth=2.0,
+                        linestyle="-",
+                        alpha=1.0,
+                        label="design (75%)",
+                    )
                 )
             elif x_surf is not None:
                 j_lo = max(0, min(ny - 1, int(round(design_y_lo / dx_mm))))
                 j_hi = max(0, min(ny - 1, int(round(design_y_hi / dx_mm))))
                 j_lo, j_hi = min(j_lo, j_hi), max(j_lo, j_hi)
-                verts = [
-                    (design_start_x, design_y_lo),
-                    (design_start_x, design_y_hi),
-                    (float(x_surf[j_hi, zmid]) * dx_mm, design_y_hi),
-                ]
-                for j in range(j_hi - 1, j_lo - 1, -1):
-                    verts.append((float(x_surf[j, zmid]) * dx_mm, j * dx_mm))
-                verts.append((float(x_surf[j_lo, zmid]) * dx_mm, design_y_lo))
-                verts.append((design_start_x, design_y_lo))
-                patch = Polygon(verts, fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)")
+                valid_y = (x_surf[:, zmid] < nx).astype(bool)
+                for ir, (ja, jb) in enumerate(_contiguous_runs_1d(j_lo, j_hi, valid_y)):
+                    patches.append(
+                        Polygon(
+                            _poly_xy(ja, jb),
+                            fill=False,
+                            edgecolor="orange",
+                            linewidth=1.6,
+                            linestyle="-",
+                            alpha=0.9,
+                            zorder=6,
+                            label="lens (in front of skull)" if ir == 0 else "_nolegend_",
+                        )
+                    )
             else:
-                patch = Rectangle(
-                    (design_start_x, design_y_lo), design_len_x, design_y_hi - design_y_lo,
-                    fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)",
+                patches.append(
+                    Rectangle(
+                        (design_start_x, design_y_lo),
+                        design_len_x,
+                        design_y_hi - design_y_lo,
+                        fill=False,
+                        edgecolor="orange",
+                        linewidth=2.0,
+                        linestyle="-",
+                        alpha=1.0,
+                        label="design (75%)",
+                    )
                 )
         elif col_idx == 1:
             if use_design_rect:
-                patch = Rectangle(
-                    (design_start_x, design_z_lo), design_len_x, design_z_hi - design_z_lo,
-                    fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)",
+                patches.append(
+                    Rectangle(
+                        (design_start_x, design_z_lo),
+                        design_len_x,
+                        design_z_hi - design_z_lo,
+                        fill=False,
+                        edgecolor="orange",
+                        linewidth=2.0,
+                        linestyle="-",
+                        alpha=1.0,
+                        label="design (75%)",
+                    )
                 )
             elif x_surf is not None:
                 k_lo = max(0, min(nz - 1, int(round(design_z_lo / dx_mm))))
                 k_hi = max(0, min(nz - 1, int(round(design_z_hi / dx_mm))))
                 k_lo, k_hi = min(k_lo, k_hi), max(k_lo, k_hi)
-                verts = [
-                    (design_start_x, design_z_lo),
-                    (design_start_x, design_z_hi),
-                    (float(x_surf[ymid, k_hi]) * dx_mm, design_z_hi),
-                ]
-                for k in range(k_hi - 1, k_lo - 1, -1):
-                    verts.append((float(x_surf[ymid, k]) * dx_mm, k * dx_mm))
-                verts.append((float(x_surf[ymid, k_lo]) * dx_mm, design_z_lo))
-                verts.append((design_start_x, design_z_lo))
-                patch = Polygon(verts, fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)")
+                valid_z = (x_surf[ymid, :] < nx).astype(bool)
+                for ir, (ka, kb) in enumerate(_contiguous_runs_1d(k_lo, k_hi, valid_z)):
+                    patches.append(
+                        Polygon(
+                            _poly_xz(ka, kb),
+                            fill=False,
+                            edgecolor="orange",
+                            linewidth=1.6,
+                            linestyle="-",
+                            alpha=0.9,
+                            zorder=6,
+                            label="lens (in front of skull)" if ir == 0 else "_nolegend_",
+                        )
+                    )
             else:
-                patch = Rectangle(
-                    (design_start_x, design_z_lo), design_len_x, design_z_hi - design_z_lo,
-                    fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)",
+                patches.append(
+                    Rectangle(
+                        (design_start_x, design_z_lo),
+                        design_len_x,
+                        design_z_hi - design_z_lo,
+                        fill=False,
+                        edgecolor="orange",
+                        linewidth=2.0,
+                        linestyle="-",
+                        alpha=1.0,
+                        label="design (75%)",
+                    )
                 )
         else:
-            # YZ: always rectangle
-            patch = Rectangle(
-                (design_y_lo, design_z_lo), design_y_hi - design_y_lo, design_z_hi - design_z_lo,
-                fill=False, edgecolor="orange", linewidth=2.0, linestyle="-", alpha=1.0, label="design (75%)",
+            patches.append(
+                Rectangle(
+                    (design_y_lo, design_z_lo),
+                    design_y_hi - design_y_lo,
+                    design_z_hi - design_z_lo,
+                    fill=False,
+                    edgecolor="orange",
+                    linewidth=2.0,
+                    linestyle="-",
+                    alpha=1.0,
+                    label="design (75%)",
+                )
             )
-        ax.add_patch(patch)
+        for p in patches:
+            ax.add_patch(p)
 
-    # Build focus-circle data from focus_centers_vox (if provided) or fall back to
-    # the single red circle at volume center that was previously always shown.
+    # Red circle marking the center point (xmid_full, ymid, zmid) visible in all 3 slice planes
     from matplotlib.patches import Circle
-    _focus_colors = ["red", "lime", "cyan", "yellow", "magenta"]
-    if focus_centers_vox is not None and len(focus_centers_vox) > 0:
-        _foci_mm = [
-            ((c[0] + 0.5) * dx_mm, (c[1] + 0.5) * dx_mm, (c[2] + 0.5) * dx_mm)
-            for c in focus_centers_vox
-        ]
-    else:
-        # Legacy single-focus at volume center
-        _foci_mm = [((xmid_full + 0.5) * dx_mm, (ymid + 0.5) * dx_mm, (zmid + 0.5) * dx_mm)]
+    center_x_mm = (xmid_full + 0.5) * dx_mm
+    center_y_mm = (ymid + 0.5) * dx_mm
+    center_z_mm = (zmid + 0.5) * dx_mm
+    ref_circle_radius_mm = 4.0
 
     def _add_reference_point(ax, col_idx: int):
-        """Draw one circle per focus center.  col_idx: 0=XY, 1=XZ, 2=YZ."""
-        for fi, (fx_mm, fy_mm, fz_mm) in enumerate(_foci_mm):
-            color = _focus_colors[fi % len(_focus_colors)]
-            lw = 2.5 if fi == 0 else 2.0
-            ls = "-" if fi == 0 else "--"
-            if col_idx == 0:    # XY: x-axis=propagation, y-axis=y
-                cx, cy = fx_mm, fy_mm
-            elif col_idx == 1:  # XZ: x-axis=propagation, y-axis=z
-                cx, cy = fx_mm, fz_mm
-            else:               # YZ: x-axis=y, y-axis=z
-                cx, cy = fy_mm, fz_mm
-            circle = Circle(
-                (cx, cy), focus_radius_mm,
-                fill=False, edgecolor=color, linewidth=lw, linestyle=ls,
-                label=f"focus {fi+1}" if col_idx == 0 else None,
-            )
-            ax.add_patch(circle)
-            # Label each circle so the two foci are distinguishable
-            ax.annotate(
-                f"F{fi+1}", xy=(cx, cy + focus_radius_mm),
-                color=color, fontsize=7, ha="center", va="bottom",
-                fontweight="bold",
-            )
+        """Draw a red circle at the center point (visible in XY, XZ, YZ)."""
+        if col_idx == 0:
+            cx, cy = center_x_mm, center_y_mm
+        elif col_idx == 1:
+            cx, cy = center_x_mm, center_z_mm
+        else:
+            cx, cy = center_y_mm, center_z_mm
+        circle = Circle((cx, cy), ref_circle_radius_mm, fill=False, edgecolor="red", linewidth=2.0)
+        ax.add_patch(circle)
 
     # --- Row 0: |P| log scale (Pa) ---
     for i in range(3):
@@ -1215,8 +1356,9 @@ def main() -> None:
     parser.add_argument("--auto-relax-dx", type=int, default=1, choices=[0, 1], help="Auto-increase dx to fit max-voxels.")
     parser.add_argument("--max-voxels", type=int, default=70000000, help="Voxel cap after resampling; -1 = auto-detect from available memory.")
     parser.add_argument("--frequency", type=float, default=5.0e5, help="Helmholtz frequency (Hz). Default: 650 kHz.")
-    parser.add_argument("--source-x-slices", type=int, default=4, help="Planar source thickness in x slices.")
-    parser.add_argument("--water-bath-mm", type=float, default=10.0, help="Water coupling layer prepended at x=0 in mm. Ensures the source fires into water before hitting the skull (default: 20 mm).")
+    parser.add_argument("--source-x-slices", type=int, default=4, help="Planar source thickness in x slices (sets transducer x position when --transducer-source=1).")
+    parser.add_argument("--transducer-source", type=int, default=1, choices=[0, 1], help="If 1 (default), use circular PZT-26 transducer aperture (Jimenez-Gambin 2019, 50 mm). If 0, use planar wave source.")
+    parser.add_argument("--water-bath-mm", type=float, default=20.0, help="Water coupling layer prepended at x=0 in mm. Ensures the source fires into water before hitting the skull (default: 20 mm).")
     parser.add_argument(
         "--waterbath1-frac", type=float, default=1.0/3.0,
         help="Fraction of water bath for waterbath1 (0-1). Default 1/3. Must sum with lens-frac to 1.",
@@ -1234,11 +1376,33 @@ def main() -> None:
     parser.add_argument("--lens-c-solid", type=float, default=2500.0, help="Reference solid speed (m/s), c=alpha*c_solid.")
     parser.add_argument("--lens-rho-solid", type=float, default=1200.0, help="Reference solid density (kg/m^3), rho=alpha*rho_solid.")
     parser.add_argument("--focus-radius-mm", type=float, default=4.0, help="Focus sphere radius in mm around red-circle center.")
-    parser.add_argument("--focus2-delta-y-mm", type=float, default=15.0, help="Second focus center: Y offset in mm from first focus (default: +15 mm).")
-    parser.add_argument("--focus2-delta-z-mm", type=float, default=0.0, help="Second focus center: Z offset in mm from first focus (default: 0 mm).")
-    parser.add_argument("--focus2-delta-x-mm", type=float, default=0.0, help="Second focus center: X offset in mm from first focus (default: 0 mm).")
-    parser.add_argument("--dual-focus", type=int, default=1, choices=[0, 1], help="Enable dual-focus optimization (default: 1). Set 0 for single focus.")
-    parser.add_argument("--lens-ct-depth-mm", type=float, default=10.0, help="Depth (mm) into CT for lens design region. Design is in CT (orange box), not water bath.")
+    parser.add_argument(
+        "--lens-ct-depth-mm",
+        type=float,
+        default=20.0,
+        help=(
+            "Lens thickness (mm) along propagation: extends LEFT from the skull surface (first CT tissue). "
+            "The RIGHT edge stays on the head/skull. This many voxels are PREPENDED as water at x=0 (like --water-bath-mm) "
+            "so the domain grows when depth increases; the lens slab is [max(source, skull−depth), skull) per (j,k); "
+            "does not advance into the head."
+        ),
+    )
+    parser.add_argument(
+        "--design-j-lo-frac", type=float, default=0.125,
+        help="Lens design band: start fraction along internal y (0..1), after water bath. Default 0.125 = central 75%% band.",
+    )
+    parser.add_argument(
+        "--design-j-hi-frac", type=float, default=0.875,
+        help="Lens design band: end fraction along internal y (0..1). Raise toward 1.0 to include more tissue on the high-y side of the slice.",
+    )
+    parser.add_argument(
+        "--design-k-lo-frac", type=float, default=0.125,
+        help="Lens design band: start fraction along internal z (0..1).",
+    )
+    parser.add_argument(
+        "--design-k-hi-frac", type=float, default=0.875,
+        help="Lens design band: end fraction along internal z (0..1). Raise toward 1.0 to extend the box toward the high-z edge (often 'top' of axial view; depends on CT orientation).",
+    )
     parser.add_argument("--opt-jit", type=int, default=0, choices=[0, 1], help="JIT compile optimization step (faster, more memory).")
     parser.add_argument(
         "--propagation-axis", type=int, default=2, choices=[0, 1, 2],
@@ -1281,7 +1445,7 @@ def main() -> None:
     parser.add_argument(
         "--crop-z-start-mm",
         type=float,
-        default=100.0,
+        default=40.0,
         help="Crop this many mm from start of z-axis after isotropic resampling (default: 0 = no crop).",
     )
     parser.add_argument(
@@ -1464,14 +1628,19 @@ def main() -> None:
         f"{'HIGH-index' if args.flip_propagation_axis else 'LOW-index'} face."
     )
 
-    # Prepend a water coupling bath at x=0.
+    # Lens thickness (mm) → extra prepend layers (same mechanism as water bath: grows the domain).
+    lens_ct_depth_mm = float(args.lens_ct_depth_mm)
+    lens_depth_vox = max(1, int(round(lens_ct_depth_mm / dx_mm)))
+    lens_prepend_vox = lens_depth_vox
+
+    # Prepend (1) lens coupling water, then (2) water coupling bath at x=0.
     # A CT volume typically fills its full FOV, so x=0 is right at the scalp/skull.
     # Without a water gap, the unit-source at x=0:source_x_slices fires directly
     # into bone, making wave injection completely inefficient.  We prepend water
     # so the source launches a plane wave that then impinges on the skull at normal
     # incidence with proper far-field development.
-    water_bath_vox = max(int(args.source_x_slices) + 4,
-                         int(round(float(args.water_bath_mm) / dx_mm)))
+    water_bath_only_vox = max(int(args.source_x_slices) + 4,
+                              int(round(float(args.water_bath_mm) / dx_mm)))
     bath_fracs = (
         float(args.waterbath1_frac),
         float(args.lens_frac),
@@ -1483,62 +1652,111 @@ def main() -> None:
     lens_x1 = 0
     design_j_lo, design_j_hi = 0, 0
     design_k_lo, design_k_hi = 0, 0
-    if water_bath_vox > 0:
-        bath_c   = np.full((water_bath_vox, c_iso.shape[1],   c_iso.shape[2]),   1480.0, dtype=np.float32)
-        bath_rho = np.full((water_bath_vox, rho_iso.shape[1], rho_iso.shape[2]), 1000.0, dtype=np.float32)
-        c_iso   = np.concatenate([bath_c,   c_iso],   axis=0)
-        rho_iso = np.concatenate([bath_rho, rho_iso], axis=0)
+    source_x_slices_int = int(args.source_x_slices)
+
+    def _prepend_water(nx_pre: int, label: str) -> None:
+        nonlocal c_iso, rho_iso, att_iso, body_mask
+        if nx_pre <= 0:
+            return
+        wc = np.full((nx_pre, c_iso.shape[1], c_iso.shape[2]), 1480.0, dtype=np.float32)
+        wr = np.full((nx_pre, rho_iso.shape[1], rho_iso.shape[2]), 1000.0, dtype=np.float32)
+        c_iso = np.concatenate([wc, c_iso], axis=0)
+        rho_iso = np.concatenate([wr, rho_iso], axis=0)
         if att_iso is not None:
-            bath_att = np.zeros((water_bath_vox, att_iso.shape[1], att_iso.shape[2]), dtype=np.float32)
-            att_iso  = np.concatenate([bath_att, att_iso], axis=0)
+            wa = np.zeros((nx_pre, att_iso.shape[1], att_iso.shape[2]), dtype=np.float32)
+            att_iso = np.concatenate([wa, att_iso], axis=0)
         if body_mask is not None:
-            bath_mask = np.zeros((water_bath_vox, body_mask.shape[1], body_mask.shape[2]), dtype=bool)
-            body_mask = np.concatenate([bath_mask, body_mask], axis=0)
-        print(f"[info] Prepended {water_bath_vox} vox ({water_bath_vox * dx_mm:.1f} mm) water coupling bath at x=0.")
-        print(f"[info] Domain after bath: shape={c_iso.shape}, voxels={np.prod(c_iso.shape):,}")
+            wm = np.zeros((nx_pre, body_mask.shape[1], body_mask.shape[2]), dtype=bool)
+            body_mask = np.concatenate([wm, body_mask], axis=0)
+        print(f"[info] Prepended {nx_pre} vox ({nx_pre * dx_mm:.1f} mm) {label} at x=0.")
+
+    if lens_prepend_vox > 0:
+        _prepend_water(lens_prepend_vox, "lens coupling (water, expands domain with --lens-ct-depth-mm)")
+    if water_bath_only_vox > 0:
+        _prepend_water(water_bath_only_vox, "water coupling bath")
+    if lens_prepend_vox > 0 or water_bath_only_vox > 0:
+        print(f"[info] Domain after prepends: shape={c_iso.shape}, voxels={np.prod(c_iso.shape):,}")
+
     nx_post = c_iso.shape[0]
     ny_post = c_iso.shape[1]
     nz_post = c_iso.shape[2]
-    # Lens design region = orange polygon: from water|CT boundary to skull surface, 75% y/z.
-    # Bounding box in x: water_bath_vox to water_bath_vox + lens_ct_depth_mm (we mask to skull inside).
-    lens_ct_depth_mm = float(args.lens_ct_depth_mm)
-    lens_depth_vox = max(1, min(nx_post - water_bath_vox, int(round(lens_ct_depth_mm / dx_mm))))
-    lens_x0 = water_bath_vox
-    lens_x1 = lens_x0 + lens_depth_vox
-    design_j_lo = max(0, int(0.125 * ny_post))
-    design_j_hi = min(ny_post, int(0.875 * ny_post))
-    design_k_lo = max(0, int(0.125 * nz_post))
-    design_k_hi = min(nz_post, int(0.875 * nz_post))
-    # Skull surface: first x where body is True. Design only in front of skull (orange polygon).
+    # First index of original CT stack after both prepends (water|CT boundary for plots).
+    ct_start_idx = lens_prepend_vox + water_bath_only_vox
+    # Back-compat name: total "bath" before CT used to be water_bath_vox only; now CT starts after lens+bath.
+    water_bath_vox = ct_start_idx
+
+    # Lens: RIGHT edge = skull (first tissue). LEFT = skull − depth; domain grows by lens_prepend_vox so
+    # increasing --lens-ct-depth-mm prepends more voxels (like water bath) instead of only stealing CT slab.
+    design_j_lo, design_j_hi = _design_band_indices_from_fracs(
+        ny_post, args.design_j_lo_frac, args.design_j_hi_frac
+    )
+    design_k_lo, design_k_hi = _design_band_indices_from_fracs(
+        nz_post, args.design_k_lo_frac, args.design_k_hi_frac
+    )
+    # Skull surface: first x where body is True. Design region = orange_mask_full (no separate logical box).
     x_surf = None
+    skull_surface_x_train = water_bath_vox  # fallback: skull starts at first CT index (after lens prepend + bath)
     if body_mask is not None and body_mask.shape == (nx_post, ny_post, nz_post):
         no_tissue = ~np.any(body_mask.astype(np.int32), axis=0)
         x_surf = np.argmax(body_mask.astype(np.int32), axis=0)
         x_surf = np.where(no_tissue, nx_post, x_surf).astype(np.float64)
-        # Extend lens_x1 so the design box covers the full skull curve in the 75% band
-        # (fixes top-right and bottom-right corners of orange in XY view).
-        x_surf_band = x_surf[design_j_lo:design_j_hi, design_k_lo:design_k_hi]
-        valid = x_surf_band < nx_post
-        if np.any(valid):
-            x_surf_max_in_band = int(np.max(x_surf_band[valid]))
-            lens_x1 = min(nx_post, max(lens_x1, x_surf_max_in_band))
+        valid_surf = x_surf[x_surf < nx_post]
+        if valid_surf.size > 0:
+            skull_surface_x_train = int(np.median(valid_surf))
+
+    orange_mask_full = _orange_mask_full_volume(
+        nx_post,
+        ny_post,
+        nz_post,
+        x_surf,
+        nx_post,
+        design_j_lo,
+        design_j_hi,
+        design_k_lo,
+        design_k_hi,
+        source_x_slices_int,
+        lens_depth_vox,
+        water_bath_vox,
+        min(nx_post, water_bath_vox + lens_depth_vox),
+    )
+    if x_surf is None and np.any(orange_mask_full):
+        print(
+            "[warn] No body mask / skull surface — orange region is the fallback x-slab in the y/z band (not skull-attached)."
+        )
+
+    _tb = _tight_bbox_from_mask(orange_mask_full)
+    lens_x0 = 0
+    lens_x1 = 0
+    design_j_lo = design_j_hi = design_k_lo = design_k_hi = 0
+    if _tb is not None:
+        lens_x0, lens_x1, design_j_lo, design_j_hi, design_k_lo, design_k_hi = _tb
+
     if lens_x1 > lens_x0:
-        print(f"[info] Lens design region (orange polygon): x=[{lens_x0}:{lens_x1}], y=[{design_j_lo}:{design_j_hi}], z=[{design_k_lo}:{design_k_hi}], mask=in front of skull.")
+        print(
+            f"[info] Lens = orange mask (tight AABB): x=[{lens_x0}:{lens_x1}], y=[{design_j_lo}:{design_j_hi}], "
+            f"z=[{design_k_lo}:{design_k_hi}], {int(np.sum(orange_mask_full)):,} voxels, "
+            f"≤{lens_depth_vox} vox depth ({lens_ct_depth_mm:.2f} mm)."
+        )
     # Debug: propagation layout for plotting
     prop_len_mm = nx_post * dx_mm
     print(
         "[debug] PLOT LAYOUT (XY and XZ): horizontal axis = propagation (internal axis 0). "
         "Source fires at index 0. Left of plot = index 0 = source end. Right = index N-1 = far end."
     )
-    if water_bath_vox > 0:
+    if ct_start_idx > 0:
+        _pp = []
+        if lens_prepend_vox > 0:
+            _pp.append(f"lens prepend {lens_prepend_vox} vox [0..{lens_prepend_vox - 1}]")
+        if water_bath_only_vox > 0:
+            _pp.append(
+                f"bath {water_bath_only_vox} vox [{lens_prepend_vox}..{ct_start_idx - 1}]"
+            )
         print(
-            f"[debug] Water bath: indices 0..{water_bath_vox - 1} "
-            f"(0..{water_bath_vox * dx_mm - dx_mm:.1f} mm). "
-            f"CT/skull: indices {water_bath_vox}..{nx_post - 1} "
-            f"({water_bath_vox * dx_mm:.1f}..{prop_len_mm:.1f} mm)."
+            f"[debug] Prepends: {', '.join(_pp)}; CT from index {ct_start_idx} "
+            f"({ct_start_idx * dx_mm:.1f} mm) to {nx_post - 1}."
         )
     else:
-        print(f"[debug] No water bath. CT spans 0..{nx_post - 1} (0..{prop_len_mm:.1f} mm).")
+        print(f"[debug] No prepends. CT spans 0..{nx_post - 1} (0..{prop_len_mm:.1f} mm).")
     print(
         "[debug] Cyan line = water|CT boundary. Red line = end of domain. "
         "Wave propagates LEFT→RIGHT in the plots."
@@ -1562,66 +1780,26 @@ def main() -> None:
             "or (3) use a lower frequency."
         )
 
-    # Mask for orange polygon only: in front of skull, and exclude background columns (no tissue).
-    # Include left-edge voxel (i=lens_x0) for every (j,k) in band so corners of the orange are filled.
-    def _orange_region_mask():
-        m = np.zeros((lens_x1 - lens_x0, design_j_hi - design_j_lo, design_k_hi - design_k_lo), dtype=bool)
-        if x_surf is None:
-            m[:] = True
-            return m
-        x_surf_slice = x_surf[design_j_lo:design_j_hi, design_k_lo:design_k_hi]  # (ly, lz)
-        ii = np.arange(lens_x0, lens_x1, dtype=np.float64)[:, None, None]
-        has_tissue = (x_surf_slice < nx_post)
-        in_front = (ii < x_surf_slice)
-        left_edge = (ii == lens_x0)  # always include left edge so corners get at least one voxel
-        m[:] = (in_front | left_edge) & has_tissue[None, :, :]
-        return m
-
-    # Compute focus centers in voxel coordinates.
-    # Focus 1: volume center.
-    cx1 = nx_post // 2
-    cy1 = ny_post // 2
-    cz1 = nz_post // 2
-    focus_centers: list = [(cx1, cy1, cz1)]
-    if bool(args.dual_focus):
-        dx2 = int(round(float(args.focus2_delta_x_mm) / dx_mm))
-        dy2 = int(round(float(args.focus2_delta_y_mm) / dx_mm))
-        dz2 = int(round(float(args.focus2_delta_z_mm) / dx_mm))
-        cx2 = max(0, min(nx_post - 1, cx1 + dx2))
-        cy2 = max(0, min(ny_post - 1, cy1 + dy2))
-        cz2 = max(0, min(nz_post - 1, cz1 + dz2))
-        focus_centers.append((cx2, cy2, cz2))
-        print(f"[info] Dual-focus enabled. Focus 1: {focus_centers[0]}, Focus 2: {focus_centers[1]}")
-    else:
-        print(f"[info] Single-focus mode. Focus: {focus_centers[0]}")
-
-    results_log_path = out_dir / "results.txt"
-    print(f"[info] Per-epoch stats will be appended to: {results_log_path}")
-
     opt_history: list[float] = []
-    orange_mask = _orange_region_mask() if lens_x1 > lens_x0 else np.zeros((0, 0, 0), dtype=bool)
-    lens_clamp_exempt_mask = np.zeros_like(c_iso, dtype=bool)
-    if lens_x1 > lens_x0:
-        lens_clamp_exempt_mask[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] = orange_mask
+    orange_mask = (
+        orange_mask_full[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].copy()
+        if lens_x1 > lens_x0
+        else np.zeros((0, 0, 0), dtype=bool)
+    )
+    lens_clamp_exempt_mask = np.asarray(orange_mask_full, dtype=bool)
     if lens_x1 > lens_x0 and int(args.opt_steps) == 0:
-        # 0 opt-steps: paint only the orange polygon with c_solid/rho_solid.
-        box_c = c_iso[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].copy()
-        box_rho = rho_iso[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi].copy()
-        box_c[orange_mask] = float(args.lens_c_solid)
-        box_rho[orange_mask] = float(args.lens_rho_solid)
-        c_iso[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] = box_c
-        rho_iso[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi] = box_rho
-        print(f"[info] 0 opt-steps: painted orange polygon only ({np.sum(orange_mask)} voxels) for visual check.")
+        c_iso = np.asarray(c_iso, dtype=np.float32)
+        rho_iso = np.asarray(rho_iso, dtype=np.float32)
+        c_iso[orange_mask_full] = float(args.lens_c_solid)
+        rho_iso[orange_mask_full] = float(args.lens_rho_solid)
+        print(
+            f"[info] 0 opt-steps: painted orange mask only ({int(np.sum(orange_mask_full))} voxels) for visual check."
+        )
     elif lens_x1 > lens_x0 and int(args.opt_steps) > 0:
         c_iso, rho_iso, opt_history = optimize_lens_with_siren(
             c_base=c_iso,
             rho_base=rho_iso,
-            lens_x0=lens_x0,
-            lens_x1=lens_x1,
-            design_j_lo=design_j_lo,
-            design_j_hi=design_j_hi,
-            design_k_lo=design_k_lo,
-            design_k_hi=design_k_hi,
+            orange_mask_full=np.asarray(orange_mask_full, dtype=bool),
             dx_mm=dx_mm,
             frequency_hz=float(args.frequency),
             source_x_slices=int(args.source_x_slices),
@@ -1640,13 +1818,10 @@ def main() -> None:
             rho_solid=float(args.lens_rho_solid),
             focus_radius_mm=float(args.focus_radius_mm),
             use_jit=bool(args.opt_jit),
-            x_surf=x_surf,
-            nx_post=nx_post,
-            focus_centers_vox=focus_centers,
-            results_log_path=results_log_path,
+            use_transducer_source=bool(args.transducer_source),
         )
     else:
-        print("[warn] Lens optimization skipped (empty lens region or --opt-steps=0).")
+        print("[warn] Lens optimization skipped (empty orange mask).")
 
     p_abs, p_phase = solve_helmholtz(
         c_iso,
@@ -1661,6 +1836,7 @@ def main() -> None:
         checkpoint=bool(args.checkpoint),
         clamp_exempt_mask=lens_clamp_exempt_mask,
         att_xyz=att_iso,
+        use_transducer_source=bool(args.transducer_source),
     )
 
     fig_slices = out_dir / "helmholtz_pressure_slices.png"
@@ -1680,8 +1856,8 @@ def main() -> None:
         bath_partition_fracs=bath_fracs,
         c_full=c_iso,
         design_region_vox=(lens_x0, lens_x1, design_j_lo, design_j_hi, design_k_lo, design_k_hi) if lens_x1 > lens_x0 else None,
-        focus_centers_vox=focus_centers,
-        focus_radius_mm=float(args.focus_radius_mm),
+        lens_depth_vox=int(lens_depth_vox) if lens_x1 > lens_x0 else 0,
+        lens_left_min_x=source_x_slices_int,
     )
 
     summary = {
@@ -1698,6 +1874,8 @@ def main() -> None:
         "crop_y_start_vox": int(crop_y_vox),
         "crop_z_start_mm": float(crop_z_mm),
         "crop_z_start_vox": int(crop_z_vox),
+        "crop_z_end_mm": float(crop_z_end_mm),
+        "crop_x_end_mm": float(crop_x_end_mm),
         "propagation_axis": int(args.propagation_axis),
         "flip_propagation_axis": bool(args.flip_propagation_axis),
         "spacing_before_mm": list(spacing_xyz_mm),
@@ -1709,8 +1887,26 @@ def main() -> None:
         "body_mask_used": mask_path is not None,
         "siren_lens_applied": lens_x1 > lens_x0,
         "water_bath_vox": water_bath_vox,
+        "lens_prepend_vox": int(lens_prepend_vox),
+        "water_bath_only_vox": int(water_bath_only_vox),
+        "ct_start_idx": int(ct_start_idx),
         "bath_partition_fracs": list(bath_fracs),
         "lens_x_range": [int(lens_x0), int(lens_x1)],
+        "lens_depth_mm": float(lens_ct_depth_mm),
+        "lens_depth_vox": int(lens_depth_vox),
+        "lens_right_attached_skull_surface": bool(x_surf is not None and lens_x1 > lens_x0),
+        "lens_design_yz_range": [
+            int(design_j_lo),
+            int(design_j_hi),
+            int(design_k_lo),
+            int(design_k_hi),
+        ],
+        "design_band_fracs": {
+            "j_lo": float(args.design_j_lo_frac),
+            "j_hi": float(args.design_j_hi_frac),
+            "k_lo": float(args.design_k_lo_frac),
+            "k_hi": float(args.design_k_hi_frac),
+        },
         "opt_steps": int(args.opt_steps),
         "opt_lr": float(args.opt_lr),
         "opt_history_loss": [float(v) for v in opt_history],
@@ -1722,27 +1918,59 @@ def main() -> None:
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
+    if lens_x1 > lens_x0:
+        lens_c = np.asarray(
+            c_iso[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi],
+            dtype=np.float32,
+        )
+        lens_rho = np.asarray(
+            rho_iso[lens_x0:lens_x1, design_j_lo:design_j_hi, design_k_lo:design_k_hi],
+            dtype=np.float32,
+        )
+        np.save(out_dir / "lens_sound_speed_ms.npy", lens_c)
+        np.save(out_dir / "lens_density_kgm3.npy", lens_rho)
+        # Save the orange polygon mask so transplant_eval can selectively paste only
+        # the pre-skull lens voxels, preserving each target patient's skull anatomy.
+        np.save(out_dir / "lens_orange_mask.npy", orange_mask.astype(np.bool_))
+        lens_npy = ["lens_sound_speed_ms.npy", "lens_density_kgm3.npy", "lens_orange_mask.npy"]
+        print(
+            f"[info] Saved lens material arrays ({lens_c.shape}): "
+            f"{lens_npy[0]}, {lens_npy[1]}, {lens_npy[2]} in {out_dir}"
+        )
+        print(
+            f"[info] Orange mask: {int(np.sum(orange_mask))} of "
+            f"{orange_mask.size} voxels active "
+            f"({100*np.sum(orange_mask)/max(orange_mask.size,1):.1f}%)"
+        )
+        summary["outputs"] = list(summary["outputs"]) + lens_npy
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+        lens_meta = {
+            "lens_right_attached_skull_surface": x_surf is not None,
+            "lens_prepend_vox": int(lens_prepend_vox),
+            "lens_depth_mm": float(lens_ct_depth_mm),
+            "lens_depth_vox": int(lens_depth_vox),
+            "lens_x0": lens_x0,
+            "lens_x1": lens_x1,
+            "design_j_lo": design_j_lo,
+            "design_j_hi": design_j_hi,
+            "design_k_lo": design_k_lo,
+            "design_k_hi": design_k_hi,
+            "design_j_lo_frac": float(args.design_j_lo_frac),
+            "design_j_hi_frac": float(args.design_j_hi_frac),
+            "design_k_lo_frac": float(args.design_k_lo_frac),
+            "design_k_hi_frac": float(args.design_k_hi_frac),
+            "dx_mm": dx_mm,
+            # Median skull-surface x (in training domain) used to align the lens
+            # to each target patient's skull surface during transplant.
+            "skull_surface_x_train": skull_surface_x_train,
+        }
+
+        json.dump(lens_meta, open(out_dir / "lens_meta.json", "w"), indent=2)
+
     print(f"[info] Isotropic shape={c_iso.shape}, dx={dx_mm:.4f} mm")
     print(f"[info] Body mask used: {mask_path is not None}")
-
-    # Append post-solve summary to results.txt
-    with open(results_log_path, "a", buffering=1) as log_fh:
-        import datetime
-        log_fh.write(f"\n{'='*70}\n")
-        log_fh.write(f"POST-SOLVE SUMMARY: {datetime.datetime.now().isoformat()}\n")
-        log_fh.write(f"final_domain_shape: {c_iso.shape}\n")
-        log_fh.write(f"dx_mm_used: {dx_mm:.4f}\n")
-        log_fh.write(f"max_pressure_abs: {float(np.max(p_abs[np.isfinite(p_abs)])) if np.any(np.isfinite(p_abs)) else 0.0:.6e}\n")
-        log_fh.write(f"focus_centers_vox: {focus_centers}\n")
-        focus_radius_vox_final = max(1, int(round(float(args.focus_radius_mm) / dx_mm)))
-        for i, c in enumerate(focus_centers):
-            mask_np = _focus_sphere_mask(c_iso.shape, radius_vox=focus_radius_vox_final, center=c)
-            in_focus = p_abs[mask_np]
-            in_focus = in_focus[np.isfinite(in_focus)]
-            rms_focus = float(np.sqrt(np.mean(in_focus ** 2) / 2.0)) if in_focus.size > 0 else 0.0
-            log_fh.write(f"focus_{i+1}_final_rms: {rms_focus:.6e} Pa  (center={c}, n_vox={int(mask_np.sum())})\n")
-        log_fh.write(f"output_figure: {fig_slices}\n")
-        log_fh.write(f"{'='*70}\n")
+    print(f"Check?")
 
 
 if __name__ == "__main__":
